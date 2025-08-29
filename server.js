@@ -5,7 +5,9 @@ const fs = require('fs');
 const path = require('path');
 
 const app = express();
-const server = app.listen(8000, () => console.log('Server running on http://localhost:8000'));
+const PORT = process.env.PORT || 8000;
+const server = app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
 const wss = new WebSocket.Server({ server });
 
 app.use(express.static(path.join(__dirname, 'public')));
@@ -22,7 +24,11 @@ try {
 }
 
 function saveConfig() {
-  fs.writeFileSync('config.json', JSON.stringify(config, null, 2));
+  try {
+    fs.writeFileSync('config.json', JSON.stringify(config, null, 2));
+  } catch (err) {
+    console.error('Error writing to config.json:', err);
+  }
 }
 
 function createBot(botConfig) {
@@ -31,22 +37,40 @@ function createBot(botConfig) {
     port: config.server.port,
     username: botConfig.username,
     password: botConfig.password || undefined,
-    version: '1.20.1' // Minecraft server versiyasini qo‘lda belgilash
+    version: '1.20.1'
   };
 
   const bot = mineflayer.createBot(options);
   bots.set(botConfig.username, bot);
 
+  let reloginTimer;
+  let antiAfkInterval;
+
   bot.on('login', () => {
     broadcast({ type: 'status', username: bot.username, status: 'logged in' });
+    
+    if (botConfig.reloginInterval && botConfig.reloginInterval > 0) {
+      reloginTimer = setTimeout(() => {
+        broadcast({ type: 'status', username: bot.username, status: 'Scheduled relogin' });
+        bot.quit();
+      }, botConfig.reloginInterval * 60 * 1000);
+    }
   });
 
   bot.on('spawn', () => {
     broadcast({ type: 'status', username: bot.username, status: 'spawned' });
-    setInterval(() => {
+    
+    antiAfkInterval = setInterval(() => {
       if (bot.entity) {
         bot.setControlState('jump', true);
         setTimeout(() => bot.setControlState('jump', false), 300);
+        
+        const directions = ['forward', 'back', 'left', 'right'];
+        const randomDir = directions[Math.floor(Math.random() * directions.length)];
+        bot.setControlState(randomDir, true);
+        setTimeout(() => bot.setControlState(randomDir, false), 500);
+        
+        bot.look(Math.random() * Math.PI * 2, Math.random() * Math.PI - Math.PI / 2);
       }
     }, 30000);
   });
@@ -61,11 +85,19 @@ function createBot(botConfig) {
   });
 
   bot.on('end', () => {
+    if (reloginTimer) clearTimeout(reloginTimer);
+    if (antiAfkInterval) clearInterval(antiAfkInterval);
+    
     broadcast({ type: 'status', username: bot.username, status: 'disconnected' });
     bots.delete(bot.username);
+    
+    if (botConfig.reloginInterval && botConfig.reloginInterval > 0) {
+      setTimeout(() => {
+        createBot(botConfig);
+      }, 5000);
+    }
   });
 
-  // Chunk size xatosini aniqlash uchun qo‘shimcha xato boshqaruvi
   bot.on('packetError', (err, packet) => {
     console.error(`Packet error for ${bot.username}:`, err, packet);
     broadcast({ type: 'status', username: bot.username, status: `packet error: ${err.message}` });
@@ -94,7 +126,12 @@ wss.on('connection', ws => {
         ws.send(JSON.stringify({ type: 'error', message: 'Maximum 10 bots allowed' }));
         return;
       }
-      const botConfig = { username: data.username, password: data.password, commands: [] };
+      const botConfig = { 
+        username: data.username, 
+        password: data.password, 
+        commands: [], 
+        reloginInterval: data.reloginInterval || 0
+      };
       config.bots.push(botConfig);
       saveConfig();
       createBot(botConfig);
@@ -122,5 +159,4 @@ wss.on('connection', ws => {
   });
 });
 
-// Initialize existing bots
 config.bots.forEach(createBot);
